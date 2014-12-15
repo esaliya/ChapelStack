@@ -1,0 +1,147 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01//EN" "http://www.w3.org/TR/html4/strict.dtd">
+<html>
+<head>
+<meta http-equiv="content-type" content="text/html; charset=iso-8859-1">
+<title>D:\Sali\pti\sub\salsa\Saliya\chapel\kmeans.chpl.html</title>
+<meta name="Generator" content="Vim/7.3">
+<meta name="plugin-version" content="vim7.3_v6">
+<meta name="syntax" content="chpl">
+<meta name="settings" content="use_css">
+<style type="text/css">
+<!--
+pre { font-family: monospace; color: #000000; background-color: #ffffff; }
+body { font-family: monospace; color: #000000; background-color: #ffffff; }
+.Comment { color: #0000ff; }
+.Constant { color: #ff00ff; }
+.Type { color: #2e8b57; font-weight: bold; }
+.Statement { color: #804040; font-weight: bold; }
+-->
+</style>
+</head>
+<body>
+<pre>
+<span class="Statement">use</span> BlockDist,ReplicatedDist;
+<span class="Statement">use</span> Random;
+<span class="Type">config</span> <span class="Type">var</span> numDim: <span class="Type">int</span> = <span class="Constant">2</span>,
+           numClusters: <span class="Type">int</span> = <span class="Constant">4</span>,
+           numPoints: <span class="Type">int</span>  = <span class="Constant">2000</span>,
+           numIter: <span class="Type">int</span> = <span class="Constant">50</span>,
+           threshold: <span class="Type">real</span> = <span class="Constant">0.0001</span>;
+
+<span class="Type">proc</span> main() {
+  writeln (<span class="Constant">&quot;dimensions: &quot;</span>, numDim);
+  writeln (<span class="Constant">&quot;clusters &quot;</span>, numClusters);
+  writeln (<span class="Constant">&quot;points: &quot;</span>, numPoints);
+  writeln (<span class="Constant">&quot;iterations: &quot;</span>, numIter);
+  writeln (<span class="Constant">&quot;threshold: &quot;</span>, threshold);
+
+  <span class="Comment">/*</span><span class="Comment"> domains </span><span class="Comment">*/</span>
+  <span class="Type">const</span> PointsSpace = {<span class="Constant">0</span>..#numPoints,<span class="Constant">0</span>..#numDim};
+  <span class="Type">const</span> ClusterSpace = {<span class="Constant">0</span>..#numClusters,<span class="Constant">0</span>..#numDim};
+  <span class="Type">const</span> ClusNumSpace = {<span class="Constant">0</span>..#numClusters};
+  <span class="Comment">/*</span><span class="Comment"> distribute points and initialize to random values </span><span class="Comment">*/</span>
+  <span class="Type">var</span> blockedLocaleView = {<span class="Constant">0</span>..#numLocales,<span class="Constant">1</span>..<span class="Constant">1</span>};
+  <span class="Type">var</span> blockedLocales: [blockedLocaleView] <span class="Type">locale</span>
+    = reshape(Locales, blockedLocaleView);
+  <span class="Comment">// this in essence blocks along the </span>
+  <span class="Comment">// zeroth dimension (i.e. range 0..#numPoints)</span>
+  <span class="Type">const</span> BlockedPointsSpace = PointsSpace
+    <span class="Type">dmapped</span> Block(boundingBox=PointsSpace,
+    targetLocales=blockedLocales);
+  <span class="Type">var</span> points: [BlockedPointsSpace] <span class="Type">real</span>;
+  <span class="Type">var</span> rand: RandomStream = <span class="Statement">new</span> RandomStream();
+  rand.fillRandom(points);
+
+  <span class="Comment">/*</span><span class="Comment"> current centers initilized to </span>
+<span class="Comment">     first N points where N = numClusters </span><span class="Comment">*/</span>
+  <span class="Type">var</span> currCenters: [ClusterSpace] <span class="Type">real</span>;
+  currCenters = points[ClusterSpace];
+
+  <span class="Comment">/*</span><span class="Comment"> new centers </span><span class="Comment">*/</span>
+  <span class="Type">var</span> newCenters: [ClusterSpace] <span class="Type">real</span>;
+
+  <span class="Comment">/*</span><span class="Comment"> replicated local center </span><span class="Comment">*/</span>
+  <span class="Type">const</span> ReplClusterSpace = ClusterSpace
+    <span class="Type">dmapped</span> ReplicatedDist();
+  <span class="Type">var</span> localCurrCenters: [ReplClusterSpace] <span class="Type">real</span>;
+  <span class="Comment">// work around to non existing atomic blocks</span>
+  <span class="Type">var</span> localCenterUpdates: [ReplClusterSpace] <span class="Type">atomic</span> <span class="Type">real</span>;
+  <span class="Type">const</span> ReplClusNumSpace = ClusNumSpace <span class="Type">dmapped</span> ReplicatedDist();
+  <span class="Type">var</span> localCenterPCounts: [ReplClusNumSpace] <span class="Type">atomic</span> <span class="Type">int</span>;
+
+  <span class="Type">var</span> converged: <span class="Type">bool</span> = <span class="Constant">false</span>;
+  <span class="Type">var</span> step: <span class="Type">int</span> = <span class="Constant">0</span>;
+  <span class="Comment">// whish something like real.max exist</span>
+  <span class="Type">const</span> MaxDist = <span class="Constant">9223372036854775807</span>;
+  <span class="Statement">while</span> (step &lt; numIter &amp;&amp; !converged) {
+    <span class="Comment">// copy currCenters to each replicand</span>
+    localCurrCenters = currCenters;
+    <span class="Comment">// reset local updates and counts</span>
+    <span class="Statement">forall</span> lcu <span class="Statement">in</span> localCenterUpdates <span class="Statement">do</span> lcu.write(<span class="Constant">0.0</span>);
+    <span class="Statement">forall</span> lcpc <span class="Statement">in</span> localCenterPCounts <span class="Statement">do</span> lcpc.write(<span class="Constant">0</span>);
+
+    <span class="Statement">forall</span> p <span class="Statement">in</span> {<span class="Constant">0</span>..#numPoints} {
+      <span class="Statement">on</span> points[p,<span class="Constant">0</span>] {
+        <span class="Type">var</span> closestC: <span class="Type">int</span> = -<span class="Constant">1</span>;
+        <span class="Type">var</span> closestDist: <span class="Type">real</span> = MaxDist;
+        <span class="Statement">for</span> c <span class="Statement">in</span> {<span class="Constant">0</span>..#numClusters} { <span class="Comment">// possibility to parallelize</span>
+          <span class="Type">var</span> dist: <span class="Type">atomic</span> <span class="Type">real</span>;
+          dist.write(<span class="Constant">0.0</span>);
+          <span class="Statement">forall</span> d <span class="Statement">in</span> {<span class="Constant">0</span>..#numDim} {
+            <span class="Type">var</span> tmp = points[p,d] - localCurrCenters[c,d];
+            dist.add(tmp*tmp);
+          }
+
+          <span class="Statement">if</span> (dist.read() &lt; closestDist) {
+            closestDist = dist.read();
+            closestC = c;
+          }
+        }
+
+        <span class="Statement">forall</span> d <span class="Statement">in</span> {<span class="Constant">0</span>..#numDim} {
+          <span class="Type">atomic</span> { <span class="Comment">// would have been great, but not implemented yet in Chapel</span>
+            localCenterUpdates[closestC,d].add(points[p,d]);
+          }
+        }
+        localCenterPCounts[closestC].add(<span class="Constant">1</span>);
+      }
+    }
+
+    <span class="Type">var</span> tmpLCU: [ClusterSpace] <span class="Type">atomic</span> <span class="Type">real</span>;
+    <span class="Statement">forall</span> tlcu <span class="Statement">in</span> tmpLCU <span class="Statement">do</span> tlcu.write(<span class="Constant">0.0</span>);
+    <span class="Type">var</span> tmpLCPC: [<span class="Constant">0</span>..#numClusters] <span class="Type">atomic</span> <span class="Type">int</span>;
+    <span class="Statement">forall</span> tlcpc <span class="Statement">in</span> tmpLCPC <span class="Statement">do</span> tlcpc.write(<span class="Constant">0</span>);
+
+    <span class="Statement">forall</span> loc <span class="Statement">in</span> Locales {
+      <span class="Statement">on</span> loc <span class="Statement">do</span> {
+        <span class="Type">cobegin</span> {
+          <span class="Statement">forall</span> (i,j) <span class="Statement">in</span> ClusterSpace {
+            tmpLCU[i,j].add(localCenterUpdates[i,j].read());
+          }
+          <span class="Statement">forall</span> i <span class="Statement">in</span> {<span class="Constant">0</span>..#numClusters} {
+            tmpLCPC[i].add(localCenterPCounts[i].read());
+          }
+        }
+      }
+    }
+
+    <span class="Type">var</span> b: <span class="Type">atomic</span> <span class="Type">bool</span>;
+    <span class="Statement">forall</span> (i,j) <span class="Statement">in</span> ClusterSpace {
+      newCenters[i,j] = tmpLCU[i,j].read()/tmpLCPC[i].read();
+      <span class="Statement">if</span> (abs(newCenters[i,j] - currCenters[i,j]) &gt; threshold){
+        b.write(<span class="Constant">false</span>);
+      }
+    }
+    converged = b.read();
+    step += <span class="Constant">1</span>;
+  }
+
+  writeln(<span class="Constant">&quot;new centers&quot;</span>);
+  writeln(newCenters);
+
+  writeln(<span class="Constant">&quot;currCenters&quot;</span>);
+  writeln(currCenters);
+}
+</pre>
+</body>
+</html>
